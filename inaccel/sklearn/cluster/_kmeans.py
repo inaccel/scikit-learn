@@ -17,21 +17,23 @@ import numpy as np
 import scipy.sparse as sp
 from joblib import Parallel, delayed, effective_n_jobs
 
-from ..base import BaseEstimator, ClusterMixin, TransformerMixin
-from ..metrics.pairwise import euclidean_distances
-from ..metrics.pairwise import pairwise_distances_argmin_min
-from ..utils.extmath import row_norms, squared_norm, stable_cumsum
-from ..utils.sparsefuncs_fast import assign_rows_csr
-from ..utils.sparsefuncs import mean_variance_axis
-from ..utils.validation import _num_samples
-from ..utils import check_array
-from ..utils import gen_batches
-from ..utils import check_random_state
-from ..utils.validation import check_is_fitted, _check_sample_weight
-from ..utils.validation import FLOAT_DTYPES
-from ..exceptions import ConvergenceWarning
-from . import _k_means_fast as _k_means
-from ._k_means_elkan import k_means_elkan
+from sklearn.base import BaseEstimator, ClusterMixin, TransformerMixin
+from sklearn.metrics.pairwise import euclidean_distances
+from sklearn.metrics.pairwise import pairwise_distances_argmin_min
+from sklearn.utils.extmath import row_norms, squared_norm, stable_cumsum
+from sklearn.utils.sparsefuncs_fast import assign_rows_csr
+from sklearn.utils.sparsefuncs import mean_variance_axis
+from sklearn.utils.validation import _num_samples
+from sklearn.utils import check_array
+from sklearn.utils import gen_batches
+from sklearn.utils import check_random_state
+from sklearn.utils.validation import check_is_fitted, _check_sample_weight
+from sklearn.utils.validation import FLOAT_DTYPES
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.cluster import _k_means_fast as _k_means
+from sklearn.cluster._k_means_elkan import k_means_elkan
+import inaccel.coral as inaccel
+from sklearn.cluster import KMeans as KMeansRef
 
 
 ###############################################################################
@@ -178,7 +180,7 @@ def _check_normalize_sample_weight(sample_weight, X):
 def k_means(X, n_clusters, sample_weight=None, init='k-means++',
             precompute_distances='auto', n_init=10, max_iter=300,
             verbose=False, tol=1e-4, random_state=None, copy_x=True,
-            n_jobs=None, algorithm="auto", return_n_iter=False):
+            n_jobs=None, algorithm="auto", return_n_iter=False, n_accel=8):
     """K-means clustering algorithm.
 
     Read more in the :ref:`User Guide <k_means>`.
@@ -270,6 +272,9 @@ def k_means(X, n_clusters, sample_weight=None, init='k-means++',
     return_n_iter : bool, optional
         Whether or not to return the number of iterations.
 
+    n_accel : int, default=8
+        The number of accelerators to try to use for the computation.
+
     Returns
     -------
     centroid : float ndarray with shape (k, n_features)
@@ -292,7 +297,7 @@ def k_means(X, n_clusters, sample_weight=None, init='k-means++',
         n_clusters=n_clusters, init=init, n_init=n_init, max_iter=max_iter,
         verbose=verbose, precompute_distances=precompute_distances, tol=tol,
         random_state=random_state, copy_x=copy_x, n_jobs=n_jobs,
-        algorithm=algorithm
+        algorithm=algorithm, n_accel=n_accel
     ).fit(X, sample_weight=sample_weight)
     if return_n_iter:
         return est.cluster_centers_, est.labels_, est.inertia_, est.n_iter_
@@ -726,6 +731,9 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
         inequality, but currently doesn't support sparse data. "auto" chooses
         "elkan" for dense data and "full" for sparse data.
 
+    n_accel : int, default=8
+        The number of accelerators to try to use for the computation.
+
     Attributes
     ----------
     cluster_centers_ : ndarray of shape (n_clusters, n_features)
@@ -793,7 +801,7 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
     def __init__(self, n_clusters=8, init='k-means++', n_init=10,
                  max_iter=300, tol=1e-4, precompute_distances='auto',
                  verbose=0, random_state=None, copy_x=True,
-                 n_jobs=None, algorithm='auto'):
+                 n_jobs=None, algorithm='auto', n_accel=8):
 
         self.n_clusters = n_clusters
         self.init = init
@@ -806,6 +814,7 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
         self.copy_x = copy_x
         self.n_jobs = n_jobs
         self.algorithm = algorithm
+        self.n_accel = n_accel
 
     def _check_test_data(self, X):
         X = check_array(X, accept_sparse='csr', dtype=FLOAT_DTYPES)
@@ -840,147 +849,206 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
         self
             Fitted estimator.
         """
-        random_state = check_random_state(self.random_state)
+        try:
+            random_state = check_random_state(self.random_state)
 
-        n_init = self.n_init
-        if n_init <= 0:
-            raise ValueError("Invalid number of initializations."
-                             " n_init=%d must be bigger than zero." % n_init)
+            n_init = self.n_init
+            if n_init <= 0:
+                raise ValueError("Invalid number of initializations."
+                                " n_init=%d must be bigger than zero." % n_init)
 
-        if self.max_iter <= 0:
-            raise ValueError(
-                'Number of iterations should be a positive number,'
-                ' got %d instead' % self.max_iter
-            )
-
-        # avoid forcing order when copy_x=False
-        order = "C" if self.copy_x else None
-        X = check_array(X, accept_sparse='csr', dtype=[np.float64, np.float32],
-                        order=order, copy=self.copy_x)
-        # verify that the number of samples given is larger than k
-        if _num_samples(X) < self.n_clusters:
-            raise ValueError("n_samples=%d should be >= n_clusters=%d" % (
-                _num_samples(X), self.n_clusters))
-
-        tol = _tolerance(X, self.tol)
-
-        # If the distances are precomputed every job will create a matrix of
-        # shape (n_clusters, n_samples). To stop KMeans from eating up memory
-        # we only activate this if the created matrix is guaranteed to be
-        # under 100MB. 12 million entries consume a little under 100MB if they
-        # are of type double.
-        precompute_distances = self.precompute_distances
-        if precompute_distances == 'auto':
-            n_samples = X.shape[0]
-            precompute_distances = (self.n_clusters * n_samples) < 12e6
-        elif isinstance(precompute_distances, bool):
-            pass
-        else:
-            raise ValueError(
-                "precompute_distances should be 'auto' or True/False"
-                ", but a value of %r was passed" %
-                precompute_distances
-            )
-
-        # Validate init array
-        init = self.init
-        if hasattr(init, '__array__'):
-            init = check_array(init, dtype=X.dtype.type, copy=True)
-            _validate_center_shape(X, self.n_clusters, init)
-
-            if n_init != 1:
-                warnings.warn(
-                    'Explicit initial center position passed: '
-                    'performing only one init in k-means instead of n_init=%d'
-                    % n_init, RuntimeWarning, stacklevel=2)
-                n_init = 1
-
-        # subtract of mean of x for more accurate distance computations
-        if not sp.issparse(X):
-            X_mean = X.mean(axis=0)
-            # The copy was already done above
-            X -= X_mean
-
-            if hasattr(init, '__array__'):
-                init -= X_mean
-
-        # precompute squared norms of data points
-        x_squared_norms = row_norms(X, squared=True)
-
-        best_labels, best_inertia, best_centers = None, None, None
-        algorithm = self.algorithm
-        if self.n_clusters == 1:
-            # elkan doesn't make sense for a single cluster, full will produce
-            # the right result.
-            algorithm = "full"
-        if algorithm == "auto":
-            algorithm = "full" if sp.issparse(X) else 'elkan'
-        if algorithm == "full":
-            kmeans_single = _kmeans_single_lloyd
-        elif algorithm == "elkan":
-            kmeans_single = _kmeans_single_elkan
-        else:
-            raise ValueError("Algorithm must be 'auto', 'full' or 'elkan', got"
-                             " %s" % str(algorithm))
-
-        seeds = random_state.randint(np.iinfo(np.int32).max, size=n_init)
-        if effective_n_jobs(self.n_jobs) == 1:
-            # For a single thread, less memory is needed if we just store one
-            # set of the best results (as opposed to one set per run per
-            # thread).
-            for seed in seeds:
-                # run a k-means once
-                labels, inertia, centers, n_iter_ = kmeans_single(
-                    X, sample_weight, self.n_clusters,
-                    max_iter=self.max_iter, init=init, verbose=self.verbose,
-                    precompute_distances=precompute_distances, tol=tol,
-                    x_squared_norms=x_squared_norms, random_state=seed)
-                # determine if these results are the best so far
-                if best_inertia is None or inertia < best_inertia:
-                    best_labels = labels.copy()
-                    best_centers = centers.copy()
-                    best_inertia = inertia
-                    best_n_iter = n_iter_
-        else:
-            # parallelisation of k-means runs
-            results = Parallel(n_jobs=self.n_jobs, verbose=0)(
-                delayed(kmeans_single)(
-                    X, sample_weight, self.n_clusters,
-                    max_iter=self.max_iter, init=init,
-                    verbose=self.verbose, tol=tol,
-                    precompute_distances=precompute_distances,
-                    x_squared_norms=x_squared_norms,
-                    # Change seed to ensure variety
-                    random_state=seed
+            if self.max_iter <= 0:
+                raise ValueError(
+                    'Number of iterations should be a positive number,'
+                    ' got %d instead' % self.max_iter
                 )
-                for seed in seeds)
-            # Get results with the lowest inertia
-            labels, inertia, centers, n_iters = zip(*results)
-            best = np.argmin(inertia)
-            best_labels = labels[best]
-            best_inertia = inertia[best]
-            best_centers = centers[best]
-            best_n_iter = n_iters[best]
 
-        if not sp.issparse(X):
-            if not self.copy_x:
-                X += X_mean
-            best_centers += X_mean
+            # avoid forcing order when copy_x=False
+            order = "C" if self.copy_x else None
+            X = check_array(X, accept_sparse='csr', dtype=[np.float64, np.float32],
+                            order=order, copy=self.copy_x)
+            # verify that the number of samples given is larger than k
+            if _num_samples(X) < self.n_clusters:
+                raise ValueError("n_samples=%d should be >= n_clusters=%d" % (
+                    _num_samples(X), self.n_clusters))
 
-        distinct_clusters = len(set(best_labels))
-        if distinct_clusters < self.n_clusters:
-            warnings.warn(
-                "Number of distinct clusters ({}) found smaller than "
-                "n_clusters ({}). Possibly due to duplicate points "
-                "in X.".format(distinct_clusters, self.n_clusters),
-                ConvergenceWarning, stacklevel=2
-            )
+            tol = _tolerance(X, self.tol)
 
-        self.cluster_centers_ = best_centers
-        self.labels_ = best_labels
-        self.inertia_ = best_inertia
-        self.n_iter_ = best_n_iter
-        return self
+            # If the distances are precomputed every job will create a matrix of
+            # shape (n_clusters, n_samples). To stop KMeans from eating up memory
+            # we only activate this if the created matrix is guaranteed to be
+            # under 100MB. 12 million entries consume a little under 100MB if they
+            # are of type double.
+            precompute_distances = self.precompute_distances
+            if precompute_distances == 'auto':
+                n_samples = X.shape[0]
+                precompute_distances = (self.n_clusters * n_samples) < 12e6
+            elif isinstance(precompute_distances, bool):
+                pass
+            else:
+                raise ValueError(
+                    "precompute_distances should be 'auto' or True/False"
+                    ", but a value of %r was passed" %
+                    precompute_distances
+                )
+            # Validate init array
+            init = self.init
+            if hasattr(init, '__array__'):
+                init = check_array(init, dtype=X.dtype.type, copy=True)
+                _validate_center_shape(X, self.n_clusters, init)
+
+                if n_init != 1:
+                    warnings.warn(
+                        'Explicit initial center position passed: '
+                        'performing only one init in k-means instead of n_init=%d'
+                        % n_init, RuntimeWarning, stacklevel=2)
+                    n_init = 1
+
+            # subtract of mean of x for more accurate distance computations
+            if not sp.issparse(X):
+                X_mean = X.mean(axis=0)
+                # The copy was already done above
+                X -= X_mean
+
+                if hasattr(init, '__array__'):
+                    init -= X_mean
+
+            # precompute squared norms of data points
+            x_squared_norms = row_norms(X, squared=True)
+
+            n_samples, n_features = X.shape
+            n_clusters = self.n_clusters
+            X1 = X
+            intercept = np.ones((X1.shape[0], 1))
+            X1 = np.concatenate((X1, intercept), axis=1)
+
+            #Data partitioning and allocating the division-remaining samples to one of the chunks
+            divisioned_n_samples = int(n_samples / self.n_accel)
+            if (n_samples % self.n_accel != 0):
+                divisioned_n_samples_even = divisioned_n_samples + \
+                                            (n_samples % self.n_accel)
+            else:
+                divisioned_n_samples_even = divisioned_n_samples
+
+            #Array Padding
+            new_n_features = int((n_features + 1 + 15) / 16) * 16
+            new_n_samples , partitioned_n_samples = [], []
+            new_n_samples1 = int((divisioned_n_samples_even +7) / 8) * 8
+            new_n_samples2 = int((divisioned_n_samples +7) / 8) * 8
+            for num in range(self.n_accel):
+                if (num==0):
+                    new_n_samples.append(new_n_samples1)
+                    partitioned_n_samples.append(divisioned_n_samples_even)
+                else:
+                    new_n_samples.append(new_n_samples2)
+                    partitioned_n_samples.append(divisioned_n_samples)
+
+            Xlist,sums_count, requests = [], [], []
+            index, temp = 0, 0
+            for num in range(self.n_accel):
+                z = np.zeros((new_n_samples1, new_n_features), dtype=np.float32)
+                temp = partitioned_n_samples[num]
+                z[0:temp, 0:n_features+1] = X1[index:index + temp, :]
+                index += temp
+                Xlist.append(inaccel.array(z))
+                sums_count.append(inaccel.array(np.empty((n_clusters, new_n_features),
+                                                         dtype=np.float32)))
+                requests.append(inaccel.request("com.inaccel.ml.KMeans.Centroids"))
+                requests[num].arg(Xlist[num], 0).arg(np.int32(n_clusters), 3) \
+                             .arg(np.int32(n_features), 4) \
+                             .arg(np.int32(new_n_samples[num]), 5)
+
+            best_labels, best_inertia, best_centers = None, None, None
+            seeds = random_state.randint(np.iinfo(np.int32).max, size=n_init)
+            for seed in seeds:
+                # ***Into algorithm function***
+                random_state = check_random_state(seed)
+                sample_weight = _check_normalize_sample_weight(sample_weight, X)
+                best_labels_ins, best_inertia_ins, best_centers_ins = None, None, None
+                centers = np.array(np.zeros((n_clusters, new_n_features), dtype=np.float32))
+                centers[:, 0:n_features] = _init_centroids(X, n_clusters, init,
+                                                           random_state=random_state,
+                                                           x_squared_norms=x_squared_norms)
+                if self.verbose:
+                    print("Initialization complete")
+                # Allocate memory to store the distances for each sample to its
+                # closer center for reallocation in case of ties
+                distances = np.zeros(shape=(X.shape[0],), dtype=X.dtype)
+                for n_iter in range(self.max_iter):
+                    centers_old = centers.copy()
+                    new_centers, session = [], []
+
+                    # Submit requests and get the sums_count
+                    for num in range(self.n_accel):
+                        new_centers.append(inaccel.array(centers))
+                        requests[num].arg(new_centers[num], 1).arg(sums_count[num], 2)
+                    for num in range(self.n_accel):
+                        session.append(inaccel.submit(requests[num]))
+                    addition = np.zeros((n_clusters, new_n_features), dtype=np.float32)
+                    for num in range(self.n_accel):
+                        inaccel.wait(session[num])
+                        addition += sums_count[num].view(np.ndarray)
+
+                    # Check for empty returned clusters
+                    empty_clusters = np.where(addition[:,n_features] == 0)[0]
+                    if len(empty_clusters):
+                        # find points to reassign empty clusters to
+                        for i, cluster_id in enumerate(empty_clusters):
+                            # XXX two relocated clusters could be close to each other
+                            new_center = X[np.random.choice(X.shape[0])]
+                            addition[cluster_id, 0:n_features] = new_center
+                            addition[cluster_id, n_features] = 1
+                    empty_clusters = np.empty(empty_clusters.shape)
+
+                    #Calculate the new centers and check convergence
+                    centers[:, 0:n_features] = addition[:,:n_features] \
+                                               / addition[:,n_features][:, np.newaxis]
+                    center_shift_total = squared_norm(centers_old - centers)
+                    if center_shift_total <= tol:
+                        if self.verbose:
+                            print("Converged at iteration %d: "
+                                "center shift %e within tolerance %e"
+                                % (n_iter, center_shift_total, tol))
+                        break
+                n_iter += 1
+                if center_shift_total >= 0:
+                    # rerun E-step in case of non-convergence so that predicted labels
+                    # match cluster centers
+                    best_labels_ins, best_inertia_ins = \
+                        _labels_inertia(X, sample_weight, x_squared_norms,
+                                        np.array(centers[:, 0:n_features], dtype=np.float64),
+                                        precompute_distances=precompute_distances,
+                                        distances=distances)
+
+                # ***Out of algorithm function***
+                if best_inertia is None or best_inertia_ins < best_inertia:
+                    best_labels = best_labels_ins.copy()
+                    best_centers = centers[:, 0:n_features].copy()
+                    best_inertia = best_inertia_ins
+                    best_n_iter = n_iter
+
+            if not sp.issparse(X):
+                if not self.copy_x:
+                    X += X_mean
+                best_centers += X_mean
+
+            distinct_clusters = len(set(best_labels))
+            if distinct_clusters < self.n_clusters:
+                warnings.warn(
+                    "Number of distinct clusters ({}) found smaller than "
+                    "n_clusters ({}). Possibly due to duplicate points "
+                    "in X.".format(distinct_clusters, self.n_clusters),
+                    ConvergenceWarning, stacklevel=2
+                )
+
+            self.cluster_centers_ = best_centers
+            self.labels_ = best_labels
+            self.inertia_ = best_inertia
+            self.n_iter_ = best_n_iter
+            return self
+        except Exception as e:
+            print (e)
+            return KMeansRef.fit(self, X, y, sample_weight)
 
     def fit_predict(self, X, y=None, sample_weight=None):
         """Compute cluster centers and predict cluster index for each sample.

@@ -18,24 +18,26 @@ from scipy import optimize, sparse
 from scipy.special import expit
 from joblib import Parallel, delayed, effective_n_jobs
 
-from ._base import LinearClassifierMixin, SparseCoefMixin, BaseEstimator
-from ._sag import sag_solver
-from ..preprocessing import LabelEncoder, LabelBinarizer
-from ..svm._base import _fit_liblinear
-from ..utils import check_array, check_consistent_length, compute_class_weight
-from ..utils import check_random_state
-from ..utils.extmath import (log_logistic, safe_sparse_dot, softmax,
+from sklearn.linear_model._base import LinearClassifierMixin, SparseCoefMixin, BaseEstimator
+from sklearn.linear_model._sag import sag_solver
+from sklearn.preprocessing import LabelEncoder, LabelBinarizer
+from sklearn.svm._base import _fit_liblinear
+from sklearn.utils import check_array, check_consistent_length, compute_class_weight
+from sklearn.utils import check_random_state
+from sklearn.utils.extmath import (log_logistic, safe_sparse_dot, softmax,
                              squared_norm)
-from ..utils.extmath import row_norms
-from ..utils.fixes import logsumexp
-from ..utils.optimize import _newton_cg, _check_optimize_result
-from ..utils.validation import check_X_y
-from ..utils.validation import check_is_fitted, _check_sample_weight
-from ..utils import deprecated
-from ..utils.multiclass import check_classification_targets
-from ..utils.fixes import _joblib_parallel_args
-from ..model_selection import check_cv
-from ..metrics import get_scorer
+from sklearn.utils.extmath import row_norms
+from sklearn.utils.fixes import logsumexp
+from sklearn.utils.optimize import _newton_cg, _check_optimize_result
+from sklearn.utils.validation import check_X_y
+from sklearn.utils.validation import check_is_fitted, _check_sample_weight
+from sklearn.utils import deprecated
+from sklearn.utils.multiclass import check_classification_targets
+from sklearn.utils.fixes import _joblib_parallel_args
+from sklearn.model_selection import check_cv
+from sklearn.metrics import get_scorer
+import inaccel.coral as inaccel
+from sklearn.linear_model import LogisticRegression as LogisticRegressionRef
 
 
 _LOGISTIC_SOLVER_CONVERGENCE_MSG = (
@@ -1346,6 +1348,9 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
         to using ``penalty='l1'``. For ``0 < l1_ratio <1``, the penalty is a
         combination of L1 and L2.
 
+    n_accel : int, default=8
+        The number of accelerators to try to use for the computation.
+
     Attributes
     ----------
 
@@ -1438,7 +1443,7 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
                  fit_intercept=True, intercept_scaling=1, class_weight=None,
                  random_state=None, solver='lbfgs', max_iter=100,
                  multi_class='auto', verbose=0, warm_start=False, n_jobs=None,
-                 l1_ratio=None):
+                 l1_ratio=None, n_accel=8):
 
         self.penalty = penalty
         self.dual = dual
@@ -1455,6 +1460,7 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
         self.warm_start = warm_start
         self.n_jobs = n_jobs
         self.l1_ratio = l1_ratio
+        self.n_accel = n_accel
 
     def fit(self, X, y, sample_weight=None):
         """
@@ -1485,136 +1491,139 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
         -----
         The SAGA solver supports both float64 and float32 bit arrays.
         """
-        solver = _check_solver(self.solver, self.penalty, self.dual)
+        try:
+            if not isinstance(self.max_iter, numbers.Number) or self.max_iter < 0:
+                raise ValueError("Maximum number of iteration must be positive;"
+                                " got (max_iter=%r)" % self.max_iter)
+            if not isinstance(self.tol, numbers.Number) or self.tol < 0:
+                raise ValueError("Tolerance for stopping criteria must be "
+                                "positive; got (tol=%r)" % self.tol)
 
-        if not isinstance(self.C, numbers.Number) or self.C < 0:
-            raise ValueError("Penalty term must be positive; got (C=%r)"
-                             % self.C)
-        if self.penalty == 'elasticnet':
-            if (not isinstance(self.l1_ratio, numbers.Number) or
-                    self.l1_ratio < 0 or self.l1_ratio > 1):
-                        raise ValueError("l1_ratio must be between 0 and 1;"
-                                         " got (l1_ratio=%r)" % self.l1_ratio)
-        elif self.l1_ratio is not None:
-            warnings.warn("l1_ratio parameter is only used when penalty is "
-                          "'elasticnet'. Got "
-                          "(penalty={})".format(self.penalty))
-        if self.penalty == 'none':
-            if self.C != 1.0:  # default values
-                warnings.warn(
-                    "Setting penalty='none' will ignore the C and l1_ratio "
-                    "parameters"
-                )
-                # Note that check for l1_ratio is done right above
-            C_ = np.inf
-            penalty = 'l2'
-        else:
-            C_ = self.C
-            penalty = self.penalty
-        if not isinstance(self.max_iter, numbers.Number) or self.max_iter < 0:
-            raise ValueError("Maximum number of iteration must be positive;"
-                             " got (max_iter=%r)" % self.max_iter)
-        if not isinstance(self.tol, numbers.Number) or self.tol < 0:
-            raise ValueError("Tolerance for stopping criteria must be "
-                             "positive; got (tol=%r)" % self.tol)
+            X, y = check_X_y(X, y)
+            check_classification_targets(y)
+            self.classes_ = np.unique(y)
+            n_samples, n_features = X.shape
 
-        if solver == 'lbfgs':
-            _dtype = np.float64
-        else:
-            _dtype = [np.float64, np.float32]
+            n_classes = len(self.classes_)
+            classes_ = self.classes_
+            if n_classes < 2:
+                raise ValueError("This solver needs samples of at least 2 classes"
+                                " in the data, but the data contains only one"
+                                " class: %r" % classes_[0])
 
-        X, y = check_X_y(X, y, accept_sparse='csr', dtype=_dtype, order="C",
-                         accept_large_sparse=solver != 'liblinear')
-        check_classification_targets(y)
-        self.classes_ = np.unique(y)
-        n_samples, n_features = X.shape
+            if len(self.classes_) == 2:
+                classes_ = classes_[1:]
 
-        multi_class = _check_multi_class(self.multi_class, solver,
-                                         len(self.classes_))
+            self.coef_ = list()
+            self.intercept_ = np.zeros(n_classes)
+            self.n_iter_ = []
 
-        if solver == 'liblinear':
-            if effective_n_jobs(self.n_jobs) != 1:
-                warnings.warn("'n_jobs' > 1 does not have any effect when"
-                              " 'solver' is set to 'liblinear'. Got 'n_jobs'"
-                              " = {}.".format(effective_n_jobs(self.n_jobs)))
-            self.coef_, self.intercept_, n_iter_ = _fit_liblinear(
-                X, y, self.C, self.fit_intercept, self.intercept_scaling,
-                self.class_weight, self.penalty, self.dual, self.verbose,
-                self.max_iter, self.tol, self.random_state,
-                sample_weight=sample_weight)
-            self.n_iter_ = np.array([n_iter_])
+            X = check_array(X, accept_sparse='csr', dtype=np.float64)
+            y = check_array(y, ensure_2d=False, dtype=None)
+            check_consistent_length(X, y)
+
+            random_state = check_random_state(self.random_state)
+
+            if self.fit_intercept:
+                X1 = np.concatenate((X, np.ones((X.shape[0], 1))), axis=1)
+
+            #Data partitioning and allocating the division-remaining samples
+            #to one of the chunks
+            divisioned_n_samples = int(n_samples / self.n_accel)
+            if (n_samples % self.n_accel != 0):
+                divisioned_n_samples_even = divisioned_n_samples + \
+                                            (n_samples % self.n_accel)
+            else:
+                divisioned_n_samples_even = divisioned_n_samples
+
+            #Array Padding
+            new_n_features = int((n_features +1 + 15) / 16) * 16
+            new_n_samples , partitioned_n_samples = [], []
+            new_n_samples1 = int((divisioned_n_samples_even +7) / 8) * 8
+            new_n_samples2 = int((divisioned_n_samples +7) / 8) * 8
+            for num in range(self.n_accel):
+                if (num==0):
+                    new_n_samples.append(new_n_samples1)
+                    partitioned_n_samples.append(divisioned_n_samples_even)
+                else:
+                    new_n_samples.append(new_n_samples2)
+                    partitioned_n_samples.append(divisioned_n_samples)
+
+            Xlist, ylist, gradients, requests = [], [], [], []
+            index, temp = 0, 0
+            for num in range(self.n_accel):
+                z = np.zeros((new_n_samples1, new_n_features), dtype=np.float32)
+                w = np.zeros((new_n_samples1, ), dtype=np.int32)
+                temp = partitioned_n_samples[num]
+                z[0:temp, 0:n_features+1] = X1[index:index + temp, :]
+                w[0:temp] = y[index:index + temp]
+                index += temp
+                Xlist.append(inaccel.array(z))
+                ylist.append(inaccel.array(w))
+                gradients.append(inaccel.array(np.empty((n_classes, new_n_features),
+                                                        dtype=np.float32)))
+                requests.append(inaccel.request("com.inaccel.ml.LogisticRegression.Gradients"))
+                requests[num].arg(ylist[num], 0).arg(Xlist[num], 1) \
+                             .arg(np.int32(n_classes), 4) \
+                             .arg(np.int32(n_features), 5) \
+                             .arg(np.int32(new_n_samples[num]), 6)
+
+            # Accelerated Momentum Gradient Descent
+            weights = np.array(np.zeros((n_classes, new_n_features), dtype=np.float32))
+            previous_weights = weights
+            gamma = 0.95
+            velocity = np.zeros_like(weights)
+
+            for n_iter in range(self.max_iter):
+                new_weights, session = [], []
+                # Submit requests and get the gradients
+                for num in range(self.n_accel):
+                    new_weights.append(inaccel.array(weights))
+                    requests[num].arg(new_weights[num], 2).arg(gradients[num], 3)
+                for num in range(self.n_accel):
+                    session.append(inaccel.submit(requests[num]))
+                addition = np.zeros((n_classes, new_n_features), dtype=np.float32)
+                for num in range(self.n_accel):
+                    inaccel.wait(session[num])
+                    addition += gradients[num].view(np.ndarray)
+
+                # Calculate the new weights
+                if self.l1_ratio is None:
+                    alpha = 0.3
+                else:
+                    alpha = max(0.1, 1.0 - self.l1_ratio)
+                velocity = np.add(gamma * velocity, (alpha / n_samples) * addition)
+                weights = np.subtract(weights, velocity)
+
+                # Convergence check
+                max_change = 0.0
+                max_weight = 0.0
+                curr_weights = weights
+
+                max_weight = max(max_weight, np.max(abs(curr_weights)))
+                curr_change = abs(np.subtract(curr_weights,previous_weights))
+                max_change = max(max_change, abs(np.max(curr_change)))
+                previous_weights = curr_weights
+                if ((max_weight != 0 and (max_change / max_weight)<= self.tol)
+                    or max_weight == 0 and max_change == 0):
+                    break
+                if (n_iter+1 == self.max_iter):
+                    if self.verbose:
+                        print('Training failed to converge, increase the number of iterations.')
+
+            n_iter += 1
+            self.n_iter_.append(n_iter)
+            self.n_iter_ = np.array(self.n_iter_, dtype=np.int32)
+            self.coef_ = np.asarray(weights[:, :n_features+1])
+
+            if self.fit_intercept:
+                self.intercept_ = self.coef_[:, -1]
+                self.coef_ = self.coef_[:, :-1]
+
             return self
-
-        if solver in ['sag', 'saga']:
-            max_squared_sum = row_norms(X, squared=True).max()
-        else:
-            max_squared_sum = None
-
-        n_classes = len(self.classes_)
-        classes_ = self.classes_
-        if n_classes < 2:
-            raise ValueError("This solver needs samples of at least 2 classes"
-                             " in the data, but the data contains only one"
-                             " class: %r" % classes_[0])
-
-        if len(self.classes_) == 2:
-            n_classes = 1
-            classes_ = classes_[1:]
-
-        if self.warm_start:
-            warm_start_coef = getattr(self, 'coef_', None)
-        else:
-            warm_start_coef = None
-        if warm_start_coef is not None and self.fit_intercept:
-            warm_start_coef = np.append(warm_start_coef,
-                                        self.intercept_[:, np.newaxis],
-                                        axis=1)
-
-        self.coef_ = list()
-        self.intercept_ = np.zeros(n_classes)
-
-        # Hack so that we iterate only once for the multinomial case.
-        if multi_class == 'multinomial':
-            classes_ = [None]
-            warm_start_coef = [warm_start_coef]
-        if warm_start_coef is None:
-            warm_start_coef = [None] * n_classes
-
-        path_func = delayed(_logistic_regression_path)
-
-        # The SAG solver releases the GIL so it's more efficient to use
-        # threads for this solver.
-        if solver in ['sag', 'saga']:
-            prefer = 'threads'
-        else:
-            prefer = 'processes'
-        fold_coefs_ = Parallel(n_jobs=self.n_jobs, verbose=self.verbose,
-                               **_joblib_parallel_args(prefer=prefer))(
-            path_func(X, y, pos_class=class_, Cs=[C_],
-                      l1_ratio=self.l1_ratio, fit_intercept=self.fit_intercept,
-                      tol=self.tol, verbose=self.verbose, solver=solver,
-                      multi_class=multi_class, max_iter=self.max_iter,
-                      class_weight=self.class_weight, check_input=False,
-                      random_state=self.random_state, coef=warm_start_coef_,
-                      penalty=penalty, max_squared_sum=max_squared_sum,
-                      sample_weight=sample_weight)
-            for class_, warm_start_coef_ in zip(classes_, warm_start_coef))
-
-        fold_coefs_, _, n_iter_ = zip(*fold_coefs_)
-        self.n_iter_ = np.asarray(n_iter_, dtype=np.int32)[:, 0]
-
-        if multi_class == 'multinomial':
-            self.coef_ = fold_coefs_[0][0]
-        else:
-            self.coef_ = np.asarray(fold_coefs_)
-            self.coef_ = self.coef_.reshape(n_classes, n_features +
-                                            int(self.fit_intercept))
-
-        if self.fit_intercept:
-            self.intercept_ = self.coef_[:, -1]
-            self.coef_ = self.coef_[:, :-1]
-
-        return self
+        except Exception as e:
+            print (e)
+            return LogisticRegressionRef.fit(self, X, y, sample_weight)
 
     def predict_proba(self, X):
         """
