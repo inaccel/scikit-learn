@@ -74,77 +74,10 @@ class _BaseNB(ClassifierMixin, BaseEstimator, metaclass=ABCMeta):
         C : ndarray of shape (n_samples,)
             Predicted target values for X
         """
-        try:
-            check_is_fitted(self)
-            X = self._check_X(X)
-            n_samples, n_features = X.shape
-            n_classes = np.size(self.classes_)
-
-            #Data partitioning and allocating the division-remaining samples
-            #to one of the chunks
-            divisioned_n_samples = int(n_samples / self.n_accel)
-            if (n_samples % self.n_accel != 0):
-                divisioned_n_samples_even = divisioned_n_samples + \
-                                            (n_samples % self.n_accel)
-            else:
-                divisioned_n_samples_even = divisioned_n_samples
-
-            #Array Padding
-            new_n_features = int((n_features + 7) / 8) * 8
-            new_n_samples , partitioned_n_samples = [], []
-            new_n_samples1 = int((divisioned_n_samples_even +7) / 8) * 8
-            new_n_samples2 = int((divisioned_n_samples + 7) / 8) * 8
-            for num in range(self.n_accel):
-                if (num==0):
-                    new_n_samples.append(new_n_samples1)
-                    partitioned_n_samples.append(divisioned_n_samples_even)
-                else:
-                    new_n_samples.append(new_n_samples2)
-                    partitioned_n_samples.append(divisioned_n_samples)
-            Xlist, requests, means, variances, priors, predictions = [], [], [], [], [], []
-            index, temp = 0, 0
-            w = np.zeros((n_classes, new_n_features), dtype=np.float32)
-            y = np.zeros((n_classes, new_n_features), dtype=np.float32)
-            w[:, 0:n_features] = self.theta_
-            y[:, 0:n_features] = self.sigma_
-            t = np.array(self.class_prior_, dtype=np.float32)
-
-            #Create requests
-            for num in range(self.n_accel):
-                z = inaccel.ndarray((new_n_samples1, new_n_features), dtype=np.float32)
-                temp = partitioned_n_samples[num]
-                z[0:temp, 0:n_features] = X[index:index + temp, :]
-                index += temp
-
-                Xlist.append(z)
-                means.append(inaccel.array(w))
-                variances.append(inaccel.array(y))
-                priors.append(inaccel.array(t))
-                predictions.append(inaccel.array(np.empty((temp,), dtype=np.int32)))
-
-                requests.append(inaccel.request("com.inaccel.ml.NaiveBayes.Classifier"))
-                requests[num].arg(Xlist[num], 0).arg(means[num], 1) \
-                             .arg(variances[num], 2) \
-                             .arg(priors[num], 3) \
-                             .arg(np.float32(0), 5) \
-                             .arg(np.int32(n_classes), 6) \
-                             .arg(np.int32(n_features), 7) \
-                             .arg(np.int32(new_n_samples[num]), 8)
-
-            # Submit requests and get the predictions
-            session = []
-            for num in range(self.n_accel):
-                requests[num].arg(predictions[num], 4)
-            for num in range(self.n_accel):
-                session.append(inaccel.submit(requests[num]))
-            aggregated_predictions = np.array([], dtype=np.int32)
-            for num in range(self.n_accel):
-                inaccel.wait(session[num])
-                aggregated_predictions = np.hstack((aggregated_predictions, predictions[num].view(np.ndarray)))
-            return aggregated_predictions.astype(float)
-        except Exception as e:
-            print (e)
-            return GaussianNBRef.predict(self, X)
+        check_is_fitted(self)
+        X = self._check_X(X)
+        jll = self._joint_log_likelihood(X)
+        return self.classes_[np.argmax(jll, axis=1)]
 
     def predict_log_proba(self, X):
         """
@@ -527,6 +460,90 @@ class GaussianNB(_BaseNB):
 
         joint_log_likelihood = np.array(joint_log_likelihood).T
         return joint_log_likelihood
+
+    def predict(self, X):
+        """
+        Perform classification on an array of test vectors X.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        C : ndarray of shape (n_samples,)
+            Predicted target values for X
+        """
+        try:
+            check_is_fitted(self)
+            X = self._check_X(X)
+            n_samples, n_features = X.shape
+            n_classes = np.size(self.classes_)
+
+            #Data partitioning and allocating the division-remaining samples
+            #to one of the chunks
+            divisioned_n_samples = int(n_samples / self.n_accel)
+            if (n_samples % self.n_accel != 0):
+                divisioned_n_samples_even = divisioned_n_samples + \
+                                            (n_samples % self.n_accel)
+            else:
+                divisioned_n_samples_even = divisioned_n_samples
+
+            #Array Padding
+            new_n_features = int((n_features + 7) / 8) * 8
+            new_n_samples , partitioned_n_samples = [], []
+            new_n_samples1 = int((divisioned_n_samples_even +7) / 8) * 8
+            new_n_samples2 = int((divisioned_n_samples + 7) / 8) * 8
+            for num in range(self.n_accel):
+                if (num==0):
+                    new_n_samples.append(new_n_samples1)
+                    partitioned_n_samples.append(divisioned_n_samples_even)
+                else:
+                    new_n_samples.append(new_n_samples2)
+                    partitioned_n_samples.append(divisioned_n_samples)
+            Xlist, requests, means, variances, priors, predictions = [], [], [], [], [], []
+            index, temp = 0, 0
+            w = np.zeros((n_classes, new_n_features), dtype=np.float32)
+            y = np.zeros((n_classes, new_n_features), dtype=np.float32)
+            w[:, 0:n_features] = self.theta_
+            y[:, 0:n_features] = self.sigma_
+            t = np.array(self.class_prior_, dtype=np.float32)
+
+            #Create requests
+            for num in range(self.n_accel):
+                z = inaccel.ndarray((new_n_samples1, new_n_features), dtype=np.float32)
+                temp = partitioned_n_samples[num]
+                z[0:temp, 0:n_features] = X[index:index + temp, :]
+                index += temp
+
+                Xlist.append(z)
+                means.append(inaccel.array(w))
+                variances.append(inaccel.array(y))
+                priors.append(inaccel.array(t))
+                predictions.append(inaccel.array(np.empty((temp,), dtype=np.int32)))
+
+                requests.append(inaccel.request("com.inaccel.ml.NaiveBayes.Classifier"))
+                requests[num].arg(Xlist[num], 0).arg(means[num], 1) \
+                             .arg(variances[num], 2) \
+                             .arg(priors[num], 3) \
+                             .arg(predictions[num], 4) \
+                             .arg(np.float32(0), 5) \
+                             .arg(np.int32(n_classes), 6) \
+                             .arg(np.int32(n_features), 7) \
+                             .arg(np.int32(new_n_samples[num]), 8)
+
+            # Submit requests and get the predictions
+            session = []
+            for num in range(self.n_accel):
+                session.append(inaccel.submit(requests[num]))
+            aggregated_predictions = np.array([], dtype=np.int32)
+            for num in range(self.n_accel):
+                inaccel.wait(session[num])
+                aggregated_predictions = np.hstack((aggregated_predictions, predictions[num].view(np.ndarray)))
+            return self.classes_[aggregated_predictions]
+        except Exception as e:
+            print (e)
+            return GaussianNBRef.predict(self, X)
 
 
 _ALPHA_MIN = 1e-10
