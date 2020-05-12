@@ -1514,6 +1514,19 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
             if len(self.classes_) == 2:
                 classes_ = classes_[1:]
 
+            #Array Padding
+            new_n_features = int((n_features +1 + 15) / 16) * 16
+
+            weights = np.array(np.zeros((n_classes, new_n_features), dtype=np.float32))
+            if self.warm_start:
+                 warm_start_coef = getattr(self, 'coef_', None)
+            else:
+                 warm_start_coef = None
+            if warm_start_coef is not None:
+                 weights[:, :n_features] = warm_start_coef
+                 if self.fit_intercept:
+                     weights[:, n_features] = self.intercept_
+
             self.coef_ = list()
             self.intercept_ = np.zeros(n_classes)
             self.n_iter_ = []
@@ -1526,6 +1539,8 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
 
             if self.fit_intercept:
                 X1 = np.concatenate((X, np.ones((X.shape[0], 1))), axis=1)
+            else:
+                X1 = np.concatenate((X, np.zeros((X.shape[0], 1))), axis=1)
 
             #Data partitioning and allocating the division-remaining samples
             #to one of the chunks
@@ -1537,7 +1552,6 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
                 divisioned_n_samples_even = divisioned_n_samples
 
             #Array Padding
-            new_n_features = int((n_features +1 + 15) / 16) * 16
             new_n_samples , partitioned_n_samples = [], []
             new_n_samples1 = int((divisioned_n_samples_even +7) / 8) * 8
             new_n_samples2 = int((divisioned_n_samples +7) / 8) * 8
@@ -1569,7 +1583,6 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
                              .arg(np.int32(new_n_samples[num]), 6)
 
             # Accelerated Momentum Gradient Descent
-            weights = np.array(np.zeros((n_classes, new_n_features), dtype=np.float32))
             previous_weights = weights
             gamma = 0.95
             velocity = np.zeros_like(weights)
@@ -1618,7 +1631,7 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
 
             if self.fit_intercept:
                 self.intercept_ = self.coef_[:, -1]
-                self.coef_ = self.coef_[:, :-1]
+            self.coef_ = self.coef_[:, :-1]
 
             return self
         except Exception as e:
