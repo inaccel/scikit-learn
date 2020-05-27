@@ -1030,6 +1030,13 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
 
             n_samples, n_features = X.shape
             n_clusters = self.n_clusters
+
+            assert n_features <= 1023, 'Unsupported n_features=%s. The '\
+                'accelerator supports maximum %s features.' % (n_features, 1023)
+            
+            assert n_clusters <= 207, 'Unsupported n_clusters=%s. The '\
+                'accelerator supports maximum %s clusters.' % (n_clusters, 207)
+
             X1 = X
             intercept = np.ones((X1.shape[0], 1))
             X1 = np.concatenate((X1, intercept), axis=1)

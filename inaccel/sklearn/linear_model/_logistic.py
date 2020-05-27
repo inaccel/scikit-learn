@@ -1319,6 +1319,13 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
             n_samples, n_features = X.shape
 
             n_classes = len(self.classes_)
+            
+            assert n_features <= 2047, 'Unsupported n_features=%s. The '\
+                'accelerator supports maximum %s features.' % (n_features, 2047)
+            
+            assert n_classes <= 64, 'Unsupported n_classes=%s. The '\
+                'accelerator supports maximum %s classes.' % (n_classes, 64)
+            
             classes_ = self.classes_
             if n_classes < 2:
                 raise ValueError("This solver needs samples of at least 2 classes"

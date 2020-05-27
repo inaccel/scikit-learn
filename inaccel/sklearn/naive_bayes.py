@@ -484,6 +484,12 @@ class GaussianNB(_BaseNB):
             X = self._check_X(X)
             n_samples, n_features = X.shape
             n_classes = np.size(self.classes_)
+            
+            assert n_features <= 2048, 'Unsupported n_features=%s. The '\
+                'accelerator supports maximum %s features.' % (n_features, 2048)
+            
+            assert n_classes <= 64, 'Unsupported n_classes=%s. The '\
+                'accelerator supports maximum %s classes.' % (n_classes, 64)
 
             #Data partitioning and allocating the division-remaining samples
             #to one of the chunks
