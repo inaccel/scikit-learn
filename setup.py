@@ -19,7 +19,7 @@ def bump(package, version):
 coral_api = '==1.8'
 
 package = 'scikit-learn'
-version = '0.23.0'
+version = '0.23.1'
 
 setup(
     name = 'inaccel-' + package,
