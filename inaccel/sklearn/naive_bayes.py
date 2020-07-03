@@ -35,6 +35,7 @@ from sklearn.utils.validation import _check_sample_weight
 from sklearn.utils.validation import _deprecate_positional_args
 import inaccel.coral as inaccel
 from sklearn.naive_bayes import GaussianNB as GaussianNBRef
+from traceback import print_exc as print_exception
 
 __all__ = ['BernoulliNB', 'GaussianNB', 'MultinomialNB', 'ComplementNB',
            'CategoricalNB']
@@ -552,8 +553,8 @@ class GaussianNB(_BaseNB):
                 inaccel.wait(session[num])
                 aggregated_predictions = np.hstack((aggregated_predictions, predictions[num].view(np.ndarray)))
             return self.classes_[aggregated_predictions]
-        except Exception as e:
-            print (e)
+        except Exception:
+            print_exception()
             return GaussianNBRef.predict(self, X)
 
 

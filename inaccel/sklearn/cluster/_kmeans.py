@@ -40,6 +40,7 @@ from sklearn.cluster._k_means_elkan import elkan_iter_chunked_dense
 from sklearn.cluster._k_means_elkan import elkan_iter_chunked_sparse
 import inaccel.coral as inaccel
 from sklearn.cluster import KMeans as KMeansRef
+from traceback import print_exc as print_exception
 
 
 ###############################################################################
@@ -1168,8 +1169,8 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
             self.inertia_ = best_inertia
             self.n_iter_ = best_n_iter
             return self
-        except Exception as e:
-            print (e)
+        except Exception:
+            print_exception()
             return KMeansRef.fit(self, X, y, sample_weight)
 
     def fit_predict(self, X, y=None, sample_weight=None):

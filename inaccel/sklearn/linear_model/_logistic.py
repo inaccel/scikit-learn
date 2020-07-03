@@ -36,6 +36,7 @@ from sklearn.model_selection import check_cv
 from sklearn.metrics import get_scorer
 import inaccel.coral as inaccel
 from sklearn.linear_model import LogisticRegression as LogisticRegressionRef
+from traceback import print_exc as print_exception
 
 
 _LOGISTIC_SOLVER_CONVERGENCE_MSG = (
@@ -1457,8 +1458,8 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
             self.coef_ = self.coef_[:, :-1]
 
             return self
-        except Exception as e:
-            print (e)
+        except Exception:
+            print_exception()
             return LogisticRegressionRef.fit(self, X, y, sample_weight)
 
     def predict_proba(self, X):
