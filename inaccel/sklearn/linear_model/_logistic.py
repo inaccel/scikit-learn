@@ -1318,6 +1318,11 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
 
             X, y = self._validate_data(X, y)
             check_classification_targets(y)
+
+            # Encode for string labels
+            le = LabelEncoder()
+            y = le.fit_transform(y).astype(X.dtype, copy=False)
+
             self.classes_ = np.unique(y)
             n_samples, n_features = X.shape
 
@@ -1329,7 +1334,7 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
             assert n_classes <= 64, 'Unsupported n_classes=%s. The '\
                 'accelerator supports maximum %s classes.' % (n_classes, 64)
             
-            classes_ = self.classes_
+            classes_ = self.classes_ = le.classes_
             if n_classes < 2:
                 raise ValueError("This solver needs samples of at least 2 classes"
                                 " in the data, but the data contains only one"
