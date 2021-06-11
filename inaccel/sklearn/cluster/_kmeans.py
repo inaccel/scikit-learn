@@ -1076,9 +1076,10 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
                 temp = partitioned_n_samples[num]
                 z[0:temp, 0:n_features+1] = X1[index:index + temp, :]
                 index += temp
-                Xlist.append(inaccel.array(z))
-                sums_count.append(inaccel.array(np.empty((n_clusters, new_n_features),
-                                                         dtype=np.float32)))
+                with inaccel.allocator:
+                    Xlist.append(np.array(z))
+                    sums_count.append(np.empty((n_clusters, new_n_features),
+                                                         dtype=np.float32))
                 requests.append(inaccel.request("com.inaccel.ml.KMeans.Centroids"))
                 requests[num].arg(Xlist[num], 0).arg(np.int32(n_clusters), 3) \
                              .arg(np.int32(n_features), 4) \
@@ -1102,17 +1103,18 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
                 distances = np.zeros(shape=(X.shape[0],), dtype=X.dtype)
                 for n_iter in range(self.max_iter):
                     centers_old = centers.copy()
-                    new_centers, session = [], []
+                    new_centers, futures = [], []
 
                     # Submit requests and get the sums_count
                     for num in range(self.n_accel):
-                        new_centers.append(inaccel.array(centers))
+                        with inaccel.allocator:
+                            new_centers.append(np.array(centers))
                         requests[num].arg(new_centers[num], 1).arg(sums_count[num], 2)
                     for num in range(self.n_accel):
-                        session.append(inaccel.submit(requests[num]))
+                        futures.append(inaccel.submit(requests[num]))
                     addition = np.zeros((n_clusters, new_n_features), dtype=np.float32)
                     for num in range(self.n_accel):
-                        inaccel.wait(session[num])
+                        futures[num].result()
                         addition += sums_count[num].view(np.ndarray)
 
                     # Check for empty returned clusters

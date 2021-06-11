@@ -1401,10 +1401,11 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
                 z[0:temp, 0:n_features+1] = X1[index:index + temp, :]
                 w[0:temp] = y[index:index + temp]
                 index += temp
-                Xlist.append(inaccel.array(z))
-                ylist.append(inaccel.array(w))
-                gradients.append(inaccel.array(np.empty((n_classes, new_n_features),
-                                                        dtype=np.float32)))
+                with inaccel.allocator:
+                    Xlist.append(np.array(z))
+                    ylist.append(np.array(w))
+                    gradients.append(np.empty((n_classes, new_n_features),
+                                                        dtype=np.float32))
                 requests.append(inaccel.request("com.inaccel.ml.LogisticRegression.Gradients"))
                 requests[num].arg(ylist[num], 0).arg(Xlist[num], 1) \
                              .arg(np.int32(n_classes), 4) \
@@ -1417,16 +1418,17 @@ class LogisticRegression(BaseEstimator, LinearClassifierMixin,
             velocity = np.zeros_like(weights)
 
             for n_iter in range(self.max_iter):
-                new_weights, session = [], []
+                new_weights, futures = [], []
                 # Submit requests and get the gradients
                 for num in range(self.n_accel):
-                    new_weights.append(inaccel.array(weights))
+                    with inaccel.allocator:
+                        new_weights.append(np.array(weights))
                     requests[num].arg(new_weights[num], 2).arg(gradients[num], 3)
                 for num in range(self.n_accel):
-                    session.append(inaccel.submit(requests[num]))
+                    futures.append(inaccel.submit(requests[num]))
                 addition = np.zeros((n_classes, new_n_features), dtype=np.float32)
                 for num in range(self.n_accel):
-                    inaccel.wait(session[num])
+                    futures[num].result()
                     addition += gradients[num].view(np.ndarray)
 
                 # Calculate the new weights

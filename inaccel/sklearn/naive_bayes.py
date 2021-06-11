@@ -523,16 +523,18 @@ class GaussianNB(_BaseNB):
 
             #Create requests
             for num in range(self.n_accel):
-                z = inaccel.ndarray((new_n_samples1, new_n_features), dtype=np.float32)
+                with inaccel.allocator:
+                    z = np.ndarray((new_n_samples1, new_n_features), dtype=np.float32)
                 temp = partitioned_n_samples[num]
                 z[0:temp, 0:n_features] = X[index:index + temp, :]
                 index += temp
 
                 Xlist.append(z)
-                means.append(inaccel.array(w))
-                variances.append(inaccel.array(y))
-                priors.append(inaccel.array(t))
-                predictions.append(inaccel.array(np.empty((temp,), dtype=np.int32)))
+                with inaccel.allocator:
+                    means.append(np.array(w))
+                    variances.append(np.array(y))
+                    priors.append(np.array(t))
+                    predictions.append(np.empty((temp,), dtype=np.int32))
 
                 requests.append(inaccel.request("com.inaccel.ml.NaiveBayes.Classifier"))
                 requests[num].arg(Xlist[num], 0).arg(means[num], 1) \
@@ -545,12 +547,12 @@ class GaussianNB(_BaseNB):
                              .arg(np.int32(new_n_samples[num]), 8)
 
             # Submit requests and get the predictions
-            session = []
+            futures = []
             for num in range(self.n_accel):
-                session.append(inaccel.submit(requests[num]))
+                futures.append(inaccel.submit(requests[num]))
             aggregated_predictions = np.array([], dtype=np.int32)
             for num in range(self.n_accel):
-                inaccel.wait(session[num])
+                futures[num].result()
                 aggregated_predictions = np.hstack((aggregated_predictions, predictions[num].view(np.ndarray)))
             return self.classes_[aggregated_predictions]
         except Exception:
