@@ -33,7 +33,6 @@ version = '0.23.1'
 setup(
     name='inaccel-' + package,
     packages=find_namespace_packages(include=['inaccel.*']),
-    namespace_packages=['inaccel'],
     version=bump(package, version),
     license='Apache-2.0',
     description='InAccel ' + package + '-like package',
@@ -56,8 +55,6 @@ setup(
         'Programming Language :: Python',
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
-        'Programming Language :: Python :: 3.10',
     ],
     python_requires='>=3.8',
 )
